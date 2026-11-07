@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+requests>=2.31
+pydantic>=2.6
+openai-agents>=0.0.7
+python-dotenv>=1.0
