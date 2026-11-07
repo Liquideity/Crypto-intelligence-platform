@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: crypto-intelligence-platform
+    runtime: python
+    plan: starter
+    region: ohio
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: OPENAI_API_KEY
+        sync: false

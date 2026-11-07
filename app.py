@@ -1,237 +1,111 @@
-import json
-import os
-from datetime import datetime, timezone
+import os, time
+from collections import defaultdict, deque
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
-load_dotenv()  # Loads a local .env file; production should use server environment variables.
+load_dotenv()
+app = FastAPI(title="Crypto Intelligence Platform", version="1.0.0")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-COINGECKO = "https://api.coingecko.com/api/v3"
-NEWS_URL = "https://cryptocurrency.cv/api/news"
-COINS = ["bitcoin", "ethereum", "solana", "binancecoin", "ripple"]
-ASSETS = {
-    "bitcoin": ("BTC", "Bitcoin"),
-    "ethereum": ("ETH", "Ethereum"),
-    "solana": ("SOL", "Solana"),
-    "binancecoin": ("BNB", "BNB"),
-    "ripple": ("XRP", "XRP"),
-}
-TIMEOUT = 15
+COINS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "binancecoin": "BNB", "ripple": "XRP"}
+_rate_log: dict[str, deque] = defaultdict(deque)
 
-app = FastAPI(title="Crypto Intelligence Platform", version="1.1.0")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def request_json(url: str, *, params: dict | None = None) -> Any:
-    response = requests.get(url, params=params, timeout=TIMEOUT, headers={"User-Agent": "CryptoIntelligenceDashboard/1.1"})
-    response.raise_for_status()
-    return response.json()
-
-
-def fetch_market() -> dict[str, Any]:
-    raw = request_json(
-        f"{COINGECKO}/simple/price",
-        params={
-            "ids": ",".join(COINS),
-            "vs_currencies": "usd",
-            "include_24hr_change": "true",
-            "include_24hr_vol": "true",
-            "include_market_cap": "true",
-        },
-    )
-    rows = []
-    for coin_id in COINS:
-        values = raw.get(coin_id, {})
-        symbol, name = ASSETS[coin_id]
-        rows.append({
-            "id": coin_id,
-            "symbol": symbol,
-            "name": name,
-            "price_usd": values.get("usd"),
-            "change_24h_pct": values.get("usd_24h_change"),
-            "volume_24h_usd": values.get("usd_24h_vol"),
-            "market_cap_usd": values.get("usd_market_cap"),
-        })
-    total_cap = sum(a["market_cap_usd"] or 0 for a in rows)
-    btc_cap = next((a["market_cap_usd"] for a in rows if a["symbol"] == "BTC"), None)
-    return {
-        "updated_at": utc_now(),
-        "assets": rows,
-        "btc_share_of_tracked_market_pct": round(btc_cap / total_cap * 100, 2) if btc_cap and total_cap else None,
-        "provider": "CoinGecko",
-    }
-
-
-def fetch_news(limit: int = 10) -> list[dict[str, str]]:
-    raw = request_json(NEWS_URL, params={"limit": limit})
-    items = raw if isinstance(raw, list) else raw.get("articles", raw.get("data", []))
-    return [{
-        "title": str(a.get("title") or "Untitled"),
-        "source": str(a.get("source") or "Unknown"),
-        "url": str(a.get("url") or a.get("link") or ""),
-        "published_at": str(a.get("published_at") or a.get("publishedAt") or ""),
-    } for a in items[:limit]]
-
-
-def fetch_btc_history(days: int = 7) -> dict[str, Any]:
-    raw = request_json(
-        f"{COINGECKO}/coins/bitcoin/market_chart",
-        params={"vs_currency": "usd", "days": days, "interval": "hourly" if days <= 7 else "daily"},
-    )
-    prices = raw.get("prices", [])
-    return {
-        "coin": "BTC",
-        "currency": "USD",
-        "days": days,
-        "updated_at": utc_now(),
-        "points": [{"time": int(p[0]), "price": p[1]} for p in prices if len(p) >= 2],
-        "provider": "CoinGecko",
-    }
-
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; connect-src 'self' https://api.coingecko.com https://cryptocurrency.cv;"
+    return response
 
 @app.get("/")
-def index():
-    return FileResponse("static/index.html")
-
+def home():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 @app.get("/api/health")
 def health():
+    return {"status": "ok", "service": "crypto-intelligence-platform"}
+
+@app.get("/api/markets")
+def markets():
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": ",".join(COINS), "vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true", "include_market_cap": "true"}
     try:
-        import agents  # noqa: F401
-        sdk_installed = True
-    except Exception:
-        sdk_installed = False
-    return {
-        "status": "ok",
-        "openai_key_configured": bool(os.getenv("OPENAI_API_KEY")),
-        "agents_sdk_installed": sdk_installed,
-        "server_time": utc_now(),
-    }
-
-
-@app.get("/api/market")
-def market():
-    try:
-        return fetch_market()
-    except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"Market data provider error: {exc}")
-
+        r = requests.get(url, params=params, timeout=15, headers={"User-Agent": "CryptoIntelligencePlatform/1.0"})
+        r.raise_for_status()
+        raw = r.json()
+        result = []
+        for coin_id, symbol in COINS.items():
+            d = raw.get(coin_id, {})
+            result.append({"id": coin_id, "symbol": symbol, "price": d.get("usd"), "change_24h": d.get("usd_24h_change"), "volume_24h": d.get("usd_24h_vol"), "market_cap": d.get("usd_market_cap")})
+        return {"markets": result, "source": "CoinGecko", "updated_at": int(time.time())}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Market data provider unavailable: {e}")
 
 @app.get("/api/news")
-def news(limit: int = 10):
+def news():
     try:
-        return {"updated_at": utc_now(), "articles": fetch_news(max(1, min(limit, 20)))}
-    except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"News provider error: {exc}")
-
+        r = requests.get("https://cryptocurrency.cv/api/news", params={"limit": 8}, timeout=15, headers={"User-Agent": "CryptoIntelligencePlatform/1.0"})
+        r.raise_for_status()
+        data = r.json()
+        articles = data if isinstance(data, list) else data.get("articles", data.get("data", []))
+        cleaned = []
+        for a in articles[:8]:
+            cleaned.append({"title": str(a.get("title", "Untitled")), "source": str(a.get("source", "Unknown")), "url": a.get("url") or a.get("link"), "published_at": a.get("published_at") or a.get("publishedAt") or a.get("date"), "summary": str(a.get("description", a.get("summary", "")))})
+        return {"articles": cleaned, "source": "cryptocurrency.cv", "updated_at": int(time.time())}
+    except (requests.RequestException, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"News provider unavailable: {e}")
 
 @app.get("/api/history/btc")
-def btc_history(days: int = 7):
+def btc_history():
     try:
-        return fetch_btc_history(max(1, min(days, 30)))
-    except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"Historical market data provider error: {exc}")
+        r = requests.get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart", params={"vs_currency": "usd", "days": "7", "interval": "hourly"}, timeout=20, headers={"User-Agent": "CryptoIntelligencePlatform/1.0"})
+        r.raise_for_status()
+        prices = r.json().get("prices", [])
+        return {"prices": [{"time": p[0], "price": p[1]} for p in prices], "source": "CoinGecko"}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Historical data unavailable: {e}")
 
-
-class AnalysisRequest(BaseModel):
-    focus: str = Field(default="Bitcoin and major cryptocurrencies", max_length=300)
-    include_news: bool = True
-
-
-def build_multi_agent_system():
-    """Expanded version of the user's original four-agent orchestration."""
-    from agents import Agent, Runner, WebSearchTool, function_tool
-
-    @function_tool
-    def get_major_crypto_prices() -> str:
-        """Retrieve current BTC, ETH, SOL, BNB and XRP prices, 24h change, volume and market cap."""
-        return json.dumps(fetch_market())
-
-    @function_tool
-    def get_crypto_news(limit: int = 8) -> str:
-        """Retrieve the latest crypto news headlines."""
-        return json.dumps(fetch_news(max(1, min(limit, 20))))
-
-    market_agent = Agent(
-        name="Market Data Agent",
-        instructions=(
-            "You specialize in current market data for BTC, ETH, SOL, BNB and XRP. "
-            "Always call get_major_crypto_prices. State the retrieval timestamp, currency and exact metrics. "
-            "Never invent missing values."
-        ),
-        tools=[get_major_crypto_prices],
-    )
-    news_agent = Agent(
-        name="News Agent",
-        instructions=(
-            "You gather and summarize material recent cryptocurrency developments, prioritizing Bitcoin "
-            "and major assets. Use get_crypto_news and web search when useful. Separate confirmed reporting "
-            "from commentary and include source names and dates when available."
-        ),
-        tools=[get_crypto_news, WebSearchTool()],
-    )
-    narrative_agent = Agent(
-        name="Narrative Agent",
-        instructions=(
-            "Research market narratives including ETF flows, BTC dominance, regulation, institutional "
-            "activity, macroeconomic links, liquidity and sentiment. Use web search. Distinguish evidence "
-            "from inference, identify counter-signals and avoid unsupported price predictions."
-        ),
-        tools=[WebSearchTool()],
-    )
-    chief_analyst = Agent(
-        name="Chief Analyst",
-        instructions=(
-            "Lead the crypto intelligence desk. Use specialist agents and return: 1) market snapshot, "
-            "2) top news, 3) dominant narratives and sentiment, 4) bullish/base/bearish scenarios with "
-            "conditions that would invalidate them, 5) risks and catalysts to watch next. Be neutral, "
-            "evidence-based and concise. Never give personalized financial advice or promise returns."
-        ),
-        tools=[
-            market_agent.as_tool(
-                tool_name="get_market_data",
-                tool_description="Delegate live price and market-metric retrieval to the Market Data Agent",
-            ),
-            news_agent.as_tool(
-                tool_name="get_news",
-                tool_description="Delegate crypto-news research to the News Agent",
-            ),
-            narrative_agent.as_tool(
-                tool_name="analyze_narratives",
-                tool_description="Delegate narrative, sentiment and catalyst research to the Narrative Agent",
-            ),
-            WebSearchTool(),
-        ],
-    )
-    return Runner, chief_analyst
-
-
-@app.post("/api/analyze")
-def analyze(request: AnalysisRequest):
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(
-            status_code=503,
-            detail="AI analysis is not configured. Set OPENAI_API_KEY on the server; never enter it in the browser.",
-        )
+@app.post("/api/analysis")
+async def analysis(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time(); q = _rate_log[ip]
+    while q and now - q[0] > 600: q.popleft()
+    if len(q) >= 3: raise HTTPException(status_code=429, detail="Analysis limit reached. Try again in 10 minutes.")
+    q.append(now)
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key: raise HTTPException(status_code=503, detail="AI analysis is not configured. Add OPENAI_API_KEY in your hosting environment.")
     try:
-        Runner, chief_analyst = build_multi_agent_system()
-        prompt = (
-            f"Prepare a current crypto intelligence briefing focused on: {request.focus}. "
-            f"Include news: {request.include_news}. Fetch current market data. Timestamp the briefing. "
-            "For each conclusion, identify whether it is measured data, reported news or analytical inference. "
-            "Include actionable watch conditions, not individualized trade instructions."
-        )
-        result = Runner.run_sync(chief_analyst, prompt)
-        return {"generated_at": utc_now(), "report": result.final_output}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Multi-agent analysis failed: {exc}")
+        from agents import Agent, Runner, WebSearchTool, function_tool
+        @function_tool
+        def get_major_crypto_prices() -> str:
+            """Fetch current BTC, ETH, SOL, BNB and XRP prices and market metrics."""
+            r = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": ",".join(COINS), "vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true", "include_market_cap": "true"}, timeout=15)
+            r.raise_for_status(); return str(r.json())
+        @function_tool
+        def get_crypto_news(limit: int = 8) -> str:
+            """Fetch recent cryptocurrency headlines."""
+            r = requests.get("https://cryptocurrency.cv/api/news", params={"limit": limit}, timeout=15); r.raise_for_status()
+            items = r.json(); items = items if isinstance(items, list) else items.get("articles", [])
+            return "\n".join(f"- {x.get('title','Untitled')} ({x.get('source','Unknown')}) {x.get('url','')}" for x in items[:limit])
+        market_agent = Agent(name="Market Data Agent", instructions="Report current market data accurately. Always use the market data tool.", tools=[get_major_crypto_prices])
+        news_agent = Agent(name="News Agent", instructions="Summarize high-impact recent crypto news with sources and dates where available.", tools=[get_crypto_news, WebSearchTool()])
+        narrative_agent = Agent(name="Narrative Agent", instructions="Analyze current crypto narratives, ETF flows, regulation, macro, liquidity and sentiment. Distinguish evidence from inference.", tools=[WebSearchTool()])
+        chief = Agent(name="Chief Analyst", instructions="Produce a professional neutral crypto intelligence report with market snapshot, top news, narratives, bullish/base/bearish scenarios, risks and watchlist. State uncertainty. No personalized financial advice or trade instructions.", tools=[market_agent.as_tool(tool_name="get_market_data", tool_description="Fetch major crypto market data"), news_agent.as_tool(tool_name="get_news", tool_description="Fetch recent crypto news"), narrative_agent.as_tool(tool_name="analyze_narratives", tool_description="Analyze current crypto narratives"), WebSearchTool()])
+        result = await Runner.run(chief, "Prepare a current intelligence briefing on BTC and major cryptocurrencies. Include BTC, ETH, SOL, BNB and XRP; source-backed news; dominant narratives; risks; and bullish, base and bearish scenarios with invalidation conditions.")
+        return {"report": result.final_output, "generated_at": int(time.time())}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": "An unexpected server error occurred."})
