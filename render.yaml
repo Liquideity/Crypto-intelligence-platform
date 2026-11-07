@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: crypto-intelligence-platform
+    name: phase10
     runtime: python
     plan: starter
     region: ohio
