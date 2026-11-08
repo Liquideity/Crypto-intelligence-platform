@@ -1,4 +1,5 @@
 import os, time, threading, csv, io
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from typing import Any
 
@@ -20,39 +21,48 @@ _rate_log: dict[str, deque] = defaultdict(deque)
 HEADERS = {"User-Agent": "Phase10-Crypto-Intelligence/2.0"}
 
 
+def _cache_get(key: str):
+    with _cache_lock:
+        return _cache.get(key)
+
+
+def _cache_set(key: str, value: Any):
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), value)
+
+
 def cached_json(key: str, url: str, params: dict | None = None, ttl: int = 300, timeout: int = 15):
     now = time.monotonic()
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
-            return hit[1], False
-        try:
-            r = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
-            r.raise_for_status()
-            data = r.json()
-            _cache[key] = (time.monotonic(), data)
-            return data, False
-        except (requests.RequestException, ValueError):
-            if hit:
-                return hit[1], True
-            raise
+    hit = _cache_get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1], False
+    try:
+        r = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        _cache_set(key, data)
+        return data, False
+    except (requests.RequestException, ValueError):
+        if hit:
+            return hit[1], True
+        raise
 
 
-def cached_text(key: str, url: str, ttl: int = 3600, timeout: int = 20):
+def cached_text(key: str, url: str, ttl: int = 21600, timeout: int = 8):
     now = time.monotonic()
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
-            return hit[1], False
-        try:
-            r = requests.get(url, timeout=timeout, headers=HEADERS)
-            r.raise_for_status()
-            _cache[key] = (time.monotonic(), r.text)
-            return r.text, False
-        except requests.RequestException:
-            if hit:
-                return hit[1], True
-            raise
+    hit = _cache_get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1], False
+    try:
+        r = requests.get(url, timeout=timeout, headers=HEADERS)
+        r.raise_for_status()
+        value = r.text
+        _cache_set(key, value)
+        return value, False
+    except requests.RequestException:
+        if hit:
+            return hit[1], True
+        raise
 
 
 @app.middleware("http")
@@ -161,25 +171,44 @@ def onchain():
 
 @app.get("/api/macro")
 def macro():
-    # FRED graph CSV is public; latest observations can be revised and are not intraday quotes.
+    # FRED graph CSV is public; these are published observations, not intraday quotes.
     series = {"DFF": "Effective federal funds rate", "DGS10": "US 10-year Treasury yield", "DTWEXBGS": "Trade-weighted US dollar index", "CPIAUCSL": "US CPI inflation (12-month)"}
-    out = {"indicators": [], "source": "Federal Reserve Bank of St. Louis FRED", "updated_at": int(time.time()), "note": "Daily series are generally previous-business-day observations; CPI is monthly. Latest release dates are shown."}
-    for sid, label in series.items():
-        try:
-            text, stale = cached_text(f"fred_{sid}", f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}", 21600)
-            rows = list(csv.DictReader(io.StringIO(text)))
-            valid = [(r.get("observation_date") or r.get("DATE"), r.get(sid)) for r in rows if r.get(sid) not in (None, "", ".")]
-            if valid:
-                date, value = valid[-1]
-                numeric_value = float(value)
-                if sid == "CPIAUCSL" and len(valid) >= 13:
-                    prior = float(valid[-13][1])
-                    numeric_value = (numeric_value / prior - 1) * 100 if prior else None
-                out["indicators"].append({"id": sid, "label": label, "value": numeric_value, "date": date, "source": "FRED" + (" · cached" if stale else "")})
-        except Exception:
-            out["indicators"].append({"id": sid, "label": label, "value": None, "date": None, "source": "Temporarily unavailable"})
-    return out
 
+    def fetch_series(item):
+        sid, label = item
+        try:
+            csv_text, stale = cached_text(
+                f"fred_{sid}",
+                f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}",
+                ttl=21600,
+                timeout=8,
+            )
+            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            valid = [(r.get("observation_date") or r.get("DATE"), r.get(sid))
+                     for r in rows if r.get(sid) not in (None, "", ".")]
+            if not valid:
+                raise ValueError("FRED returned no usable observations")
+            date, value = valid[-1]
+            numeric_value = float(value)
+            if sid == "CPIAUCSL" and len(valid) >= 13:
+                prior = float(valid[-13][1])
+                numeric_value = (numeric_value / prior - 1) * 100 if prior else None
+            return {"id": sid, "label": label, "value": numeric_value, "date": date,
+                    "source": "FRED" + (" · cached fallback" if stale else "")}
+        except Exception as exc:
+            print(f"FRED {sid} unavailable: {type(exc).__name__}: {exc}")
+            return {"id": sid, "label": label, "value": None, "date": None,
+                    "source": "Temporarily unavailable"}
+
+    # Fetch independently and concurrently: one slow series cannot block the other three.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        indicators = list(pool.map(fetch_series, series.items()))
+    return {
+        "indicators": indicators,
+        "source": "Federal Reserve Bank of St. Louis FRED",
+        "updated_at": int(time.time()),
+        "note": "Daily series are generally previous-business-day observations; CPI is monthly. Latest release dates are shown.",
+    }
 
 @app.post("/api/analysis")
 async def analysis(request: Request):
