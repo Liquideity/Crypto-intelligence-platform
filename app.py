@@ -17,6 +17,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 COINS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "binancecoin": "BNB", "ripple": "XRP"}
 _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
+# One lock per cache key prevents concurrent cache misses from stampeding an upstream.
+_key_locks: dict[str, threading.Lock] = {}
+# Monotonic deadlines for temporary upstream rate-limit cooldowns.
+_rate_limit_until: dict[str, float] = {}
 _rate_log: dict[str, deque] = defaultdict(deque)
 HEADERS = {"User-Agent": "Phase10-Crypto-Intelligence/2.0"}
 
@@ -31,21 +35,68 @@ def _cache_set(key: str, value: Any):
         _cache[key] = (time.monotonic(), value)
 
 
+def _key_lock(key: str):
+    with _cache_lock:
+        return _key_locks.setdefault(key, threading.Lock())
+
+
+def _rate_limit_cooldown(response) -> int:
+    """Return a bounded cooldown using Retry-After when the provider supplies it."""
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            return max(1, min(int(float(retry_after)), 3600))
+        except (TypeError, ValueError):
+            pass
+    return 60
+
+
 def cached_json(key: str, url: str, params: dict | None = None, ttl: int = 300, timeout: int = 15):
-    now = time.monotonic()
+    # Fast path for a fresh cache entry.
     hit = _cache_get(key)
+    now = time.monotonic()
     if hit and now - hit[0] < ttl:
         return hit[1], False
-    try:
-        r = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
-        r.raise_for_status()
-        data = r.json()
-        _cache_set(key, data)
-        return data, False
-    except (requests.RequestException, ValueError):
-        if hit:
-            return hit[1], True
-        raise
+
+    # Only one request per key may refresh a stale/missing entry at a time.
+    with _key_lock(key):
+        hit = _cache_get(key)
+        now = time.monotonic()
+        if hit and now - hit[0] < ttl:
+            return hit[1], False
+
+        with _cache_lock:
+            cooldown_until = _rate_limit_until.get(key, 0)
+        if cooldown_until > now:
+            if hit:
+                return hit[1], True
+            raise requests.HTTPError(
+                f"Upstream rate-limit cooldown active for cache key '{key}'"
+            )
+
+        try:
+            response = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
+            if response.status_code == 429:
+                cooldown = _rate_limit_cooldown(response)
+                with _cache_lock:
+                    _rate_limit_until[key] = time.monotonic() + cooldown
+                response.raise_for_status()
+            response.raise_for_status()
+            data = response.json()
+            _cache_set(key, data)
+            with _cache_lock:
+                _rate_limit_until.pop(key, None)
+            return data, False
+        except (requests.RequestException, ValueError) as exc:
+            # A 429 should not trigger repeated calls on every dashboard refresh.
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 429:
+                cooldown = _rate_limit_cooldown(response)
+                with _cache_lock:
+                    _rate_limit_until[key] = time.monotonic() + cooldown
+            if hit:
+                return hit[1], True
+            raise
 
 
 def cached_text(key: str, url: str, ttl: int = 21600, timeout: int = 8):
@@ -103,9 +154,9 @@ def markets():
 @app.get("/api/overview")
 def overview():
     try:
-        data, stale = cached_json("global", "https://api.coingecko.com/api/v3/global", ttl=600)
+        data, stale = cached_json("global", "https://api.coingecko.com/api/v3/global", ttl=1800, timeout=12)
         d = data.get("data", {})
-        return {"total_market_cap_usd": d.get("total_market_cap", {}).get("usd"), "total_volume_24h_usd": d.get("total_volume", {}).get("usd"), "btc_dominance_pct": d.get("market_cap_percentage", {}).get("btc"), "market_cap_change_24h_pct": d.get("market_cap_change_percentage_24h_usd"), "active_cryptocurrencies": d.get("active_cryptocurrencies"), "source": "CoinGecko Global" + (" · cached fallback" if stale else ""), "updated_at": int(time.time())}
+        return {"total_market_cap_usd": d.get("total_market_cap", {}).get("usd"), "total_volume_24h_usd": d.get("total_volume", {}).get("usd"), "btc_dominance_pct": d.get("market_cap_percentage", {}).get("btc"), "market_cap_change_24h_pct": d.get("market_cap_change_percentage_24h_usd"), "active_cryptocurrencies": d.get("active_cryptocurrencies"), "source": "CoinGecko Global" + (" · cached fallback" if stale else ""), "updated_at": int(time.time()), "cached": stale}
     except requests.RequestException as e:
         raise HTTPException(502, f"Global market overview unavailable: {e}")
 
